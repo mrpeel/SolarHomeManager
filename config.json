@@ -1,0 +1,116 @@
+{
+  "FRONIUS_EXPORT_IS_POSITIVE": false,
+  "TIMEZONE": "Australia/Sydney",
+  "CITY_NAME": "Sydney",
+  "VOLTAGE": 240,
+  "MIN_AMPS": 5,
+  "MAX_AMPS": 32,
+  "BUFFER_WATTS": 150,
+  "EV_PRIORITY_SOC_THRESHOLD": 90,
+  "LOCATION_TOLERANCE": 0.001,
+  "HISTORY_WINDOW_MINUTES": 15,
+  "POLLING_INTERVAL_MINUTES": 5,
+  "THROTTLE_INTERVAL_MINUTES": 10,
+  "TELEMETRY_REFRESH_MINUTES": 15,
+  "WAKE_COOLDOWN_MINUTES": 60,
+  "TESLA_API_BASE_URL": "https://fleet-api.prd.na.vn.cloud.tesla.com",
+  "PRESENCE_VACANT_AFTER_MINS": 45,
+  "HVAC_ESTIMATED_WATTS": 2000,
+  "HVAC_MIN_ON_MINUTES": 15,
+  "HVAC_MIN_OFF_MINUTES": 6,
+  "HVAC_MANUAL_OVERRIDE_MINUTES": 120,
+  "WEATHER_REFRESH_MINUTES": 30,
+  "DAYTIME_HOURS": [
+    7,
+    22
+  ],
+  "DAY_COMFORT_MIN_C": 18.0,
+  "DAY_COMFORT_MAX_C": 24.0,
+  "DAY_COOL_TARGET_C": 22.0,
+  "DAY_HEAT_TARGET_C": 20.0,
+  "NIGHT_COMFORT_MIN_C": 16.0,
+  "NIGHT_COMFORT_MAX_C": 23.0,
+  "NIGHT_COOL_TARGET_C": 21.0,
+  "NIGHT_HEAT_TARGET_C": 18.0,
+  "UNOCCUPIED_COOL_SETBACK_C": 1.5,
+  "UNOCCUPIED_HEAT_SETBACK_C": -1.5,
+  "PRECOOL_FORECAST_MAX_C": 30.0,
+  "PRECOOL_TARGET_C": 21.0,
+  "PREHEAT_FORECAST_MAX_C": 16.0,
+  "PREHEAT_FORECAST_MIN_C": 8.0,
+  "PREHEAT_TARGET_C": 22.0,
+  "NIGHT_PURGE_DELTA_C": 2.0,
+  "NIGHT_PURGE_MIN_OUTDOOR_C": 15.0,
+  "MIN_TOTAL_DAMPER_PCT": 120,
+  "ZONES": {
+    "0": {
+      "priority": 0.9,
+      "occupied_hours": [
+        20,
+        8
+      ],
+      "weekend_occupied_hours": [
+        7,
+        22
+      ],
+      "min_damper": 20
+    },
+    "1": {
+      "priority": 1.0,
+      "occupied_hours": [
+        7,
+        22
+      ],
+      "weekend_occupied_hours": [
+        7,
+        22
+      ],
+      "min_damper": 30
+    },
+    "2": {
+      "priority": 0.7,
+      "occupied_hours": [
+        15,
+        8
+      ],
+      "weekend_occupied_hours": [
+        7,
+        22
+      ],
+      "min_damper": 0
+    },
+    "3": {
+      "priority": 0.7,
+      "occupied_hours": [
+        15,
+        8
+      ],
+      "weekend_occupied_hours": [
+        7,
+        22
+      ],
+      "min_damper": 0
+    },
+    "4": {
+      "priority": 0.8,
+      "occupied_hours": [
+        8,
+        18
+      ],
+      "weekend_occupied_hours": [
+        9,
+        17
+      ],
+      "min_damper": 15
+    }
+  },
+  "ROLLOUT_STAGE": 3,
+  "DRY_RUN": false,
+  "DRY_RUN_TESLA": false,
+  "DRY_RUN_CLIMATE": true,
+  "MOCK_TESLA": false,
+  "MOCK_WALL_CONNECTOR": false,
+  "MOCK_AIRTOUCH": true,
+  "MOCK_WEATHER": true,
+  "MOCK_API_FAILURE_RATE": 0.05
+}

@@ -1,0 +1,4 @@
+requests>=2.31.0
+astral>=3.2
+python-dotenv>=1.0.1
+tesla-fleet-api>=1.5.0

@@ -1,0 +1,23 @@
+# Python virtual environment
+env/
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Local configuration & environment secrets
+.env
+state_cache.json
+tesla_private_key.pem
+presence_log.jsonl
+
+# Execution logs
+execution.log
+*.log
+logs/
+tests/temp_test_logs
+
+# System/IDE files
+.DS_Store
+.idea/
+.vscode/
