@@ -197,6 +197,10 @@ def load_config():
         "PREHEAT_TARGET_C": 22.0,
         "NIGHT_PURGE_DELTA_C": 2.0,
         "NIGHT_PURGE_MIN_OUTDOOR_C": 15.0,
+        "FAN_LOW_TEMP_C": 21.0,
+        "FAN_MED_TEMP_C": 22.0,
+        "FAN_HIGH_TEMP_C": 23.0,
+        "FAN_OFF_DIFFERENTIAL_C": 0.5,
         "MIN_TOTAL_DAMPER_PCT": 120,
         "ZONES": {
             "0": {
@@ -364,6 +368,8 @@ def read_cache():
         "airtouch_last_dispatched": {},
         "airtouch_manual_override_until": None,
         "airtouch_last_power_change_time": None,
+        "airtouch_last_compressor_change_time": None,
+        "hvac_compressor_running": None,
         "hvac_active_tier": "IDLE",
         "hvac_solar_bank_cancelled_date": None,
         "weather_state": {},
@@ -1644,6 +1650,59 @@ def can_change_ac_power(
     return True, None
 
 
+def compressor_is_running(live_ac: Dict) -> bool:
+    """True if the compressor is currently running (COOL/HEAT/DRY), False for FAN/OFF."""
+    return live_ac.get("power") == "ON" and live_ac.get("mode") in ("COOL", "HEAT", "DRY")
+
+
+def can_change_compressor(
+    target_running: bool, current_running: bool, cache: Dict, now: dt, config: Dict
+) -> Tuple[bool, Optional[str]]:
+    """
+    Enforces minimum compressor run-time and off-time across *mode* changes
+    (e.g. FAN<->COOL), which the power-toggle guard cannot see because AC
+    power stays ON. Uses airtouch_last_compressor_change_time; no timestamp
+    on record means no constraint (fresh cache or manual change long past).
+    """
+    if target_running == current_running:
+        return True, None
+
+    last_change_str = cache.get("airtouch_last_compressor_change_time")
+    if not last_change_str:
+        return True, None
+
+    try:
+        last_change_dt = dt.fromisoformat(last_change_str).astimezone(now.tzinfo)
+        elapsed_mins = (now - last_change_dt).total_seconds() / 60.0
+    except Exception:
+        return True, None
+
+    if current_running and not target_running:
+        min_on = float(config.get("HVAC_MIN_ON_MINUTES", 15))
+        if elapsed_mins < min_on:
+            return (
+                False,
+                f"Compressor min run-time guard ({elapsed_mins:.1f}/{min_on:.0f} mins elapsed)",
+            )
+    elif not current_running and target_running:
+        min_off = float(config.get("HVAC_MIN_OFF_MINUTES", 6))
+        if elapsed_mins < min_off:
+            return (
+                False,
+                f"Compressor min off-time guard ({elapsed_mins:.1f}/{min_off:.0f} mins elapsed)",
+            )
+
+    return True, None
+
+
+def tier1_blocks_banking(tier1_active: bool, hvac_plan: Dict) -> bool:
+    """
+    Fan-only circulation never blocks solar thermal banking (Tier 3 may
+    supersede it); compressor-driven Tier 1 tiers (COOL/HEAT/NIGHT_PURGE) do.
+    """
+    return bool(tier1_active) and hvac_plan.get("tier") != "TIER1_FAN_CIRCULATE"
+
+
 def build_zone_plan_for_mode(
     mode: str,
     is_solar_banking: bool,
@@ -1757,6 +1816,12 @@ def evaluate_tier1_immediate_comfort(
     Evaluates Priority 1: Immediate Home Climate Comfort & Differential Night Purge.
     Uses Daytime (18-24°C) vs Nighttime (16-23°C) comfort bands, and treats any zone
     that is either scheduled-occupied OR currently switched ON as an active comfort zone.
+
+    Below the compressor triggers, graduated fan-only circulation (21°C low,
+    22°C medium, 23°C high with 0.5°C switch-off hysteresis) keeps air moving
+    for comfort at negligible (~80W) draw. Compressor modes always take
+    precedence at their triggers; Tier 3 solar banking may supersede fan-only
+    operation but never the reverse.
     """
     zones_cfg = config.get("ZONES", {})
     live_zones = airtouch_state.get("zones", {})
@@ -1828,6 +1893,54 @@ def evaluate_tier1_immediate_comfort(
             "reason": (
                 f"Immediate cooling needed ({band['period']} band {heat_trigger:.0f}-{cool_trigger:.0f}°C): "
                 f"{max_zone_name}={max_temp_c:.1f}°C >= {cool_trigger:.1f}°C -> Target {cool_target:.1f}°C"
+            ),
+        }
+
+    # Graduated fan-only circulation for the warm-but-not-hot band.
+    # Compressor triggers above take precedence; this branch only runs when no
+    # compressor action is needed. Thresholds shift down by the switch-off
+    # differential while already circulating, giving 0.5°C hysteresis so the
+    # fan does not flutter at a boundary.
+    fan_low = float(config.get("FAN_LOW_TEMP_C", 21.0))
+    fan_med = float(config.get("FAN_MED_TEMP_C", 22.0))
+    fan_high = float(config.get("FAN_HIGH_TEMP_C", 23.0))
+    fan_hyst = float(config.get("FAN_OFF_DIFFERENTIAL_C", 0.5))
+    if active_tier == "TIER1_FAN_CIRCULATE":
+        fan_low -= fan_hyst
+        fan_med -= fan_hyst
+        fan_high -= fan_hyst
+    fan_speed = None
+    if max_temp_c >= fan_high:
+        fan_speed = "HIGH"
+    elif max_temp_c >= fan_med:
+        fan_speed = "MEDIUM"
+    elif max_temp_c >= fan_low:
+        fan_speed = "LOW"
+    if fan_speed is not None:
+        zone_cmds: List[Dict] = []
+        if not any(z.get("power") == "ON" for z in live_zones.values()):
+            # Nothing open to push air through: open scheduled-occupied zones,
+            # keeping their existing control mode/setpoints (power only).
+            for z_key, z_meta in sorted(zones_cfg.items(), key=lambda x: int(x[0])):
+                if is_zone_effectively_occupied(z_meta, now):
+                    zone_cmds.append(
+                        {
+                            "zone_index": int(z_key),
+                            "name": z_meta.get("name", f"Zone_{z_key}"),
+                            "power": "ON",
+                        }
+                    )
+        return True, {
+            "tier": "TIER1_FAN_CIRCULATE",
+            "power": "ON",
+            "mode": "FAN",
+            "fan_speed": fan_speed,
+            "setpoint_c": None,
+            "zone_commands": zone_cmds,
+            "draws_compressor_power": False,
+            "reason": (
+                f"Fan circulation ({band['period']}): {max_zone_name}={max_temp_c:.1f}°C -> "
+                f"FAN {fan_speed} (compressor off)"
             ),
         }
 
@@ -2248,10 +2361,12 @@ def run_solar_loop(
     if not current_charging and not target_charging:
         # Even when solar is insufficient for EV charging, execute Stage 3/4 HVAC evaluation
         if flags["eval_climate"] and airtouch_state is not None:
-            if not manual_override_active and not tier1_active:
-                _, hvac_plan = evaluate_tier3_solar_banking(
+            if not manual_override_active and not tier1_blocks_banking(tier1_active, hvac_plan):
+                tier3_active_here, tier3_plan_here = evaluate_tier3_solar_banking(
                     now, sunset, pool_after_tier1, airtouch_state, weather_state, cache, config
                 )
+                if tier3_active_here:
+                    hvac_plan = tier3_plan_here
             _finalize_hvac_execution(
                 now, airtouch_state, hvac_plan, manual_override_active, cache, config, flags
             )
@@ -2279,10 +2394,12 @@ def run_solar_loop(
 
             # Since car is unplugged, full solar pool is available for Tier 3 HVAC banking!
             if flags["eval_climate"] and airtouch_state is not None:
-                if not manual_override_active and not tier1_active:
-                    _, hvac_plan = evaluate_tier3_solar_banking(
+                if not manual_override_active and not tier1_blocks_banking(tier1_active, hvac_plan):
+                    tier3_active_here, tier3_plan_here = evaluate_tier3_solar_banking(
                         now, sunset, pool_after_tier1, airtouch_state, weather_state, cache, config
                     )
+                    if tier3_active_here:
+                        hvac_plan = tier3_plan_here
                 _finalize_hvac_execution(
                     now, airtouch_state, hvac_plan, manual_override_active, cache, config, flags
                 )
@@ -2445,10 +2562,12 @@ def run_solar_loop(
 
         # Car cannot charge -> all remaining solar is available for Tier 3 HVAC banking!
         if flags["eval_climate"] and airtouch_state is not None:
-            if not manual_override_active and not tier1_active:
-                _, hvac_plan = evaluate_tier3_solar_banking(
+            if not manual_override_active and not tier1_blocks_banking(tier1_active, hvac_plan):
+                tier3_active_here, tier3_plan_here = evaluate_tier3_solar_banking(
                     now, sunset, pool_after_tier1, airtouch_state, weather_state, cache, config
                 )
+                if tier3_active_here:
+                    hvac_plan = tier3_plan_here
             _finalize_hvac_execution(
                 now, airtouch_state, hvac_plan, manual_override_active, cache, config, flags
             )
@@ -2464,18 +2583,22 @@ def run_solar_loop(
             # PRIORITY 2: EV is below 90% SoC -> EV gets first claim on solar pool!
             ev_allocated_w = (target_amps * config["VOLTAGE"]) if target_charging else 0.0
             solar_for_tier3 = max(0.0, pool_after_tier1 - ev_allocated_w)
-            if not manual_override_active and not tier1_active:
-                _, hvac_plan = evaluate_tier3_solar_banking(
+            if not manual_override_active and not tier1_blocks_banking(tier1_active, hvac_plan):
+                tier3_active_here, tier3_plan_here = evaluate_tier3_solar_banking(
                     now, sunset, solar_for_tier3, airtouch_state, weather_state, cache, config
                 )
+                if tier3_active_here:
+                    hvac_plan = tier3_plan_here
         else:
             # PRIORITY 3 beats PRIORITY 4 (90% <= SoC < charge_limit):
             # Evaluate Tier 3 Solar Pre-Cool/Pre-Heat BEFORE allocating to EV 90-100%!
             tier3_active = False
-            if not manual_override_active and not tier1_active:
-                tier3_active, hvac_plan = evaluate_tier3_solar_banking(
+            if not manual_override_active and not tier1_blocks_banking(tier1_active, hvac_plan):
+                tier3_active, tier3_plan = evaluate_tier3_solar_banking(
                     now, sunset, pool_after_tier1, airtouch_state, weather_state, cache, config
                 )
+                if tier3_active:
+                    hvac_plan = tier3_plan
             if tier3_active:
                 solar_for_tier4 = max(0.0, pool_after_tier1 - hvac_est_watts)
                 if flags["control_climate"]:
@@ -2666,6 +2789,16 @@ def _finalize_hvac_execution(
     target_on = hvac_plan.get("power") == "ON"
 
     allowed, block_reason = can_change_ac_power(target_on, current_on, cache, now, config)
+    if allowed:
+        # Compressor short-cycle guard across *mode* changes (e.g. FAN<->COOL),
+        # which the power-toggle guard above cannot see. Ground the current
+        # state in live telemetry on first contact; track transitions on dispatch.
+        if cache.get("hvac_compressor_running") is None:
+            cache["hvac_compressor_running"] = compressor_is_running(live_ac)
+        target_compressor = target_on and hvac_plan.get("mode") in ("COOL", "HEAT")
+        allowed, block_reason = can_change_compressor(
+            target_compressor, bool(cache["hvac_compressor_running"]), cache, now, config
+        )
     if not allowed:
         print(f"[{now}] [HVAC GUARD] {block_reason}. Holding current AC power state.")
         hvac_plan = {
@@ -2700,6 +2833,10 @@ def _finalize_hvac_execution(
         ):
             if target_on != current_on:
                 cache["airtouch_last_power_change_time"] = now.isoformat()
+            target_compressor = target_on and hvac_plan.get("mode") in ("COOL", "HEAT")
+            if bool(cache.get("hvac_compressor_running")) != target_compressor:
+                cache["hvac_compressor_running"] = target_compressor
+                cache["airtouch_last_compressor_change_time"] = now.isoformat()
             cache["hvac_active_tier"] = hvac_plan.get("tier", "IDLE")
             cache["airtouch_last_dispatched"] = _snapshot_airtouch_expectations(
                 airtouch_state, hvac_plan

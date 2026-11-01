@@ -106,11 +106,14 @@ Because an air conditioner cannot maintain a single exact degree without short-c
        >= 24.0°C                      >= 23.0°C            --->  [TIER 1: IMMEDIATE COOLING TRIGGER]
           |                              |                       • Cools active rooms to 22.0°C (Day) / 21.0°C (Night)
           |                              |                       • Uses FAN Night Purge if outdoor is >= 2°C cooler
-     22.0°C–23.9°C                  21.0°C–22.9°C                [UPPER PASSIVE COMFORT DEADBAND]
-          |                              |                       • Normal days: AC stays OFF
-          |                              |                       • Hot Forecast (>=30°C) + Solar (>=2000W):
-          |                              |                         [TIER 3: SOLAR PRE-COOL] cools down to 21.0°C
-     20.0°C–22.0°C                  18.0°C–21.0°C                [NEUTRAL COMFORT CORE]
+     23.0°C–23.9°C                  22.0°C–22.9°C                [TIER 1: FAN CIRCULATE — HIGH]
+          |                              |                       • Air moves, compressor stays off (~80W draw)
+          |                              |                       • Switches off below 22.5°C (0.5°C hysteresis)
+     22.0°C–22.9°C                  21.0°C–21.9°C                [TIER 1: FAN CIRCULATE — MEDIUM]
+          |                              |                       • Switches off below 21.5°C (0.5°C hysteresis)
+     21.0°C–21.9°C                  20.0°C–20.9°C                [TIER 1: FAN CIRCULATE — LOW]
+          |                              |                       • Switches off below 20.5°C (day band floor)
+     20.0°C–22.0°C                  18.0°C–21.0°C                [NEUTRAL COMFORT CORE — fan off]
           |                              |                       • Cold Forecast (<=16°C / min <=8°C) + Solar (>=2000W):
           |                              |                         [TIER 3: SOLAR PRE-HEAT] warms up to 22.0°C
      18.1°C–19.9°C                  16.1°C–17.9°C                [LOWER PASSIVE COMFORT DEADBAND]
@@ -118,6 +121,15 @@ Because an air conditioner cannot maintain a single exact degree without short-c
        <= 18.0°C                      <= 16.0°C            --->  [TIER 1: IMMEDIATE HEATING TRIGGER]
                                                                  • Heats active rooms to 20.0°C (Day) / 18.0°C (Night)
 ```
+
+Note: the fan band sits *below* the old "upper passive deadband" — rooms that
+previously sat still at 21–24°C now get moving air instead of nothing. The
+compressor still takes precedence at its triggers, and a compressor run/off
+guard (`HVAC_MIN_ON/OFF_MINUTES`, tracked across FAN↔COOL mode changes, not
+just power toggles) prevents short-cycling at the boundaries. Tier 3 solar
+pre-cooling (hot forecast + ≥2000W export) supersedes fan circulation when it
+fires; Tier 4 EV top-off is evaluated on whatever solar remains after it.
+
 
 ### 5.2 Summary of Temperature Parameters (`config.json`)
 
@@ -130,6 +142,8 @@ Because an air conditioner cannot maintain a single exact degree without short-c
 | `NIGHT_COOL_TARGET_C` / `HEAT_TARGET_C` | `21.0°C` / `18.0°C` | Nighttime target temperature once Tier 1 Cooling or Heating activates. |
 | `UNOCCUPIED_COOL_SETBACK_C` | `+1.5°C` | Setpoint relaxation added to scheduled-unoccupied rooms during cooling (`+1.5°C`). |
 | `UNOCCUPIED_HEAT_SETBACK_C` | `-1.5°C` | Setpoint relaxation applied to scheduled-unoccupied rooms during heating (`-1.5°C`). |
+| `FAN_LOW_TEMP_C` / `MED` / `HIGH_TEMP_C` | `21.0°C` / `22.0°C` / `23.0°C` | Indoor thresholds for graduated fan-only circulation (LOW/MEDIUM/HIGH), compressor off. |
+| `FAN_OFF_DIFFERENTIAL_C` | `0.5°C` | Switch-off hysteresis for fan circulation: once running, each stage holds until 0.5°C below its entry temperature. |
 | `PRECOOL_FORECAST_MAX_C` / `TARGET_C` | `30.0°C` / `21.0°C` | BOM forecast high gate and target temperature for Tier 3 Solar Pre-Cooling. |
 | `PREHEAT_FORECAST_MAX_C` / `MIN_C` / `TARGET_C` | `16.0°C` / `8.0°C` / `22.0°C` | BOM forecast gates and target temperature for Tier 3 Solar Pre-Heating. |
 

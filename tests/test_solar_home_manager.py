@@ -479,9 +479,11 @@ class TestProgressiveRolloutAnd4TierPriority(unittest.TestCase):
     ):
         """
         Priority 2 (EV < 90% SoC) beats Priority 3 (Solar Pre-Cooling):
-        Home is comfortable (22.5°C), Forecast is hot (33°C), Solar is 3000W, EV is at 70% SoC.
+        Home is at 22.5°C (fan-circulation band), Forecast is hot (33°C),
+        Solar is 3000W, EV is at 70% SoC.
         EV claims 11A (2640W), leaving only 360W (< 2000W needed for Tier 3 Pre-Cool).
-        Result: EV charges at 11A, Tier 3 Pre-Cool does NOT start.
+        Result: EV charges at 11A, Tier 3 Pre-Cool does NOT start, and the fan
+        circulates (MEDIUM) for comfort while the EV charges.
         """
         self.base_config["ROLLOUT_STAGE"] = 4
         self.base_config["DRY_RUN_CLIMATE"] = False
@@ -519,9 +521,12 @@ class TestProgressiveRolloutAnd4TierPriority(unittest.TestCase):
             mock_weather=wx_state,
         )
 
-        mock_dispatch_at.assert_not_called()
+        mock_dispatch_at.assert_called_once()
+        dispatched_ac_cmd = mock_dispatch_at.call_args[0][1]
+        self.assertEqual(dispatched_ac_cmd.get("mode"), "FAN")
+        self.assertEqual(dispatched_ac_cmd.get("fan_speed"), "MEDIUM")
         cache = solar_home_manager.read_cache()
-        self.assertEqual(cache["hvac_active_tier"], "IDLE")
+        self.assertEqual(cache["hvac_active_tier"], "TIER1_FAN_CIRCULATE")
         self.assertTrue(cache["charging"])
         self.assertEqual(cache["amps"], 11)
 
@@ -764,12 +769,17 @@ class TestProgressiveRolloutAnd4TierPriority(unittest.TestCase):
         night_time = dt(2026, 10, 21, 23, 0, 0, tzinfo=tz)
         cache = solar_home_manager.read_cache()
 
-        # At 23.4°C: Daytime (18-24°C) should be IDLE, Nighttime (16-23°C) should trigger COOL to 21.0°C!
+        # At 23.4°C: Daytime (18-24°C) runs graduated FAN circulation (HIGH),
+        # Nighttime (16-23°C) still triggers compressor COOL to 21.0°C.
         at_23_4 = make_mock_airtouch_state(ac_power="OFF", living_temp=23.4)
-        day_need, _ = solar_home_manager.evaluate_tier1_immediate_comfort(
+        day_need, day_plan = solar_home_manager.evaluate_tier1_immediate_comfort(
             day_time, at_23_4, None, cache, self.base_config
         )
-        self.assertFalse(day_need)
+        self.assertTrue(day_need)
+        self.assertEqual(day_plan["tier"], "TIER1_FAN_CIRCULATE")
+        self.assertEqual(day_plan["mode"], "FAN")
+        self.assertEqual(day_plan["fan_speed"], "HIGH")
+        self.assertFalse(day_plan["draws_compressor_power"])
 
         night_need, night_plan = solar_home_manager.evaluate_tier1_immediate_comfort(
             night_time, at_23_4, None, cache, self.base_config
@@ -791,6 +801,157 @@ class TestProgressiveRolloutAnd4TierPriority(unittest.TestCase):
         self.assertTrue(day_heat_need)
         self.assertEqual(day_heat_plan["tier"], "TIER1_COMFORT_HEAT")
         self.assertEqual(day_heat_plan["setpoint_c"], 20.0)
+
+    def test_fan_circulation_graduated_speeds(self):
+        """Daytime heat band drives fan speed without the compressor: 21C LOW, 22C MEDIUM, 23C HIGH."""
+        tz = ZoneInfo("Australia/Sydney")
+        day_time = dt(2026, 10, 21, 14, 0, 0, tzinfo=tz)
+        for temp_c, expected_speed in [(21.0, "LOW"), (22.0, "MEDIUM"), (23.0, "HIGH")]:
+            cache = solar_home_manager.read_cache()
+            at_state = make_mock_airtouch_state(ac_power="OFF", living_temp=temp_c)
+            needed, plan = solar_home_manager.evaluate_tier1_immediate_comfort(
+                day_time, at_state, None, cache, self.base_config
+            )
+            self.assertTrue(needed, f"temp={temp_c}")
+            self.assertEqual(plan["tier"], "TIER1_FAN_CIRCULATE")
+            self.assertEqual(plan["power"], "ON")
+            self.assertEqual(plan["mode"], "FAN")
+            self.assertEqual(plan["fan_speed"], expected_speed)
+            self.assertFalse(plan["draws_compressor_power"])
+
+    def test_fan_circulation_hysteresis_holds_until_below_differential(self):
+        """Once circulating, the fan stays on until temp drops 0.5C below the entry point."""
+        tz = ZoneInfo("Australia/Sydney")
+        day_time = dt(2026, 10, 21, 14, 0, 0, tzinfo=tz)
+
+        cache = solar_home_manager.read_cache()
+        cache["hvac_active_tier"] = "TIER1_FAN_CIRCULATE"
+        at_warm = make_mock_airtouch_state(ac_power="ON", ac_mode="FAN", living_temp=20.8)
+        needed, plan = solar_home_manager.evaluate_tier1_immediate_comfort(
+            day_time, at_warm, None, cache, self.base_config
+        )
+        self.assertTrue(needed)
+        self.assertEqual(plan["tier"], "TIER1_FAN_CIRCULATE")
+        self.assertEqual(plan["fan_speed"], "LOW")
+
+        cache2 = solar_home_manager.read_cache()
+        cache2["hvac_active_tier"] = "TIER1_FAN_CIRCULATE"
+        at_cool = make_mock_airtouch_state(ac_power="ON", ac_mode="FAN", living_temp=20.4)
+        needed2, _ = solar_home_manager.evaluate_tier1_immediate_comfort(
+            day_time, at_cool, None, cache2, self.base_config
+        )
+        self.assertFalse(needed2)
+
+    def test_fan_circulation_opens_scheduled_zones_when_all_closed(self):
+        """Fan with every damper closed would dead-head: scheduled zones are powered ON (mode/setpoint untouched)."""
+        tz = ZoneInfo("Australia/Sydney")
+        day_time = dt(2026, 10, 21, 14, 0, 0, tzinfo=tz)
+        cache = solar_home_manager.read_cache()
+        at_state = make_mock_airtouch_state(ac_power="OFF", living_temp=22.5)
+        for z in at_state["zones"].values():
+            z["power"] = "OFF"
+        needed, plan = solar_home_manager.evaluate_tier1_immediate_comfort(
+            day_time, at_state, None, cache, self.base_config
+        )
+        self.assertTrue(needed)
+        self.assertEqual(plan["tier"], "TIER1_FAN_CIRCULATE")
+        self.assertTrue(plan["zone_commands"], "expected airflow-path commands")
+        self.assertTrue(all(c.get("power") == "ON" for c in plan["zone_commands"]))
+        self.assertTrue(
+            all("control_mode" not in c and "setpoint_c" not in c for c in plan["zone_commands"]),
+            "zone temperatures must not be touched by fan circulation",
+        )
+
+    def test_fan_circulation_leaves_open_zones_alone(self):
+        """When dampers are already open, fan circulation sends no zone commands at all."""
+        tz = ZoneInfo("Australia/Sydney")
+        day_time = dt(2026, 10, 21, 14, 0, 0, tzinfo=tz)
+        cache = solar_home_manager.read_cache()
+        at_state = make_mock_airtouch_state(ac_power="OFF", living_temp=22.5)
+        needed, plan = solar_home_manager.evaluate_tier1_immediate_comfort(
+            day_time, at_state, None, cache, self.base_config
+        )
+        self.assertTrue(needed)
+        self.assertEqual(plan["zone_commands"], [])
+
+    def test_compressor_guard_blocks_fan_to_cool_restart(self):
+        """FAN->COOL within the off-time window is held; the power-toggle guard alone would allow it."""
+        tz = ZoneInfo("Australia/Sydney")
+        now = dt(2026, 10, 19, 12, 4, 0, tzinfo=tz)
+
+        cache = solar_home_manager.read_cache()
+        cache["hvac_compressor_running"] = False
+        cache["airtouch_last_compressor_change_time"] = dt(
+            2026, 10, 19, 12, 1, 0, tzinfo=tz
+        ).isoformat()  # stopped 3 mins ago (< 6 min off-time)
+        allowed, reason = solar_home_manager.can_change_compressor(
+            True, False, cache, now, self.base_config
+        )
+        self.assertFalse(allowed)
+        self.assertIn("min off-time", reason)
+
+        # Stopping a running compressor too soon is also held.
+        cache2 = solar_home_manager.read_cache()
+        cache2["hvac_compressor_running"] = True
+        cache2["airtouch_last_compressor_change_time"] = dt(
+            2026, 10, 19, 12, 0, 0, tzinfo=tz
+        ).isoformat()  # started 4 mins ago (< 15 min run-time)
+        allowed2, reason2 = solar_home_manager.can_change_compressor(
+            False, True, cache2, now, self.base_config
+        )
+        self.assertFalse(allowed2)
+        self.assertIn("min run-time", reason2)
+
+        # No timestamp on record (fresh cache) -> allowed.
+        cache3 = solar_home_manager.read_cache()
+        allowed3, _ = solar_home_manager.can_change_compressor(
+            True, False, cache3, now, self.base_config
+        )
+        self.assertTrue(allowed3)
+
+    @patch("solar_home_manager.get_tesla_vehicle_data")
+    def test_tier3_supersedes_fan_only_circulation(self, mock_vehicle):
+        """
+        On a hot forecast day with strong solar and SoC >= 90%, Tier 3 pre-cool
+        replaces fan-only circulation (compressor need beats airflow comfort).
+        """
+        self.base_config["ROLLOUT_STAGE"] = 3
+        tz = ZoneInfo("Australia/Sydney")
+        midday = dt(2026, 10, 19, 12, 0, 0, tzinfo=tz)
+
+        mock_twc = {
+            "vehicle_connected": True,
+            "contactor_closed": False,
+            "vehicle_current_a": 0.0,
+            "grid_v": 240.0,
+        }
+        mock_vehicle.return_value = {
+            "latitude": -33.8688,
+            "longitude": 151.2093,
+            "charging_state": "Stopped",
+            "battery_level": 92,
+            "charge_limit_soc": 100,
+        }
+        # 22.5C indoor would only merit fan circulation on its own...
+        at_state = make_mock_airtouch_state(ac_power="OFF", living_temp=22.5)
+        # ...but a 33C forecast with 3kW export triggers Tier 3 pre-cooling.
+        wx_state = {
+            "outdoor_temp_c": 27.0,
+            "cloud_cover_pct": 0.0,
+            "forecast_max_c": 33.0,
+            "forecast_min_c": 18.0,
+        }
+
+        solar_home_manager.run_solar_loop(
+            override_time=midday,
+            mock_power=-3000.0,
+            mock_twc=mock_twc,
+            mock_airtouch=at_state,
+            mock_weather=wx_state,
+        )
+
+        cache = solar_home_manager.read_cache()
+        self.assertEqual(cache["shadow_hvac_plan"]["tier"], "TIER3_PRECOOL")
 
     def test_zone_level_manual_turn_on_triggers_override_not_shutoff(self):
         """
