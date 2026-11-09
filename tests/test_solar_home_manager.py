@@ -210,6 +210,49 @@ class TestSolarControlMath(unittest.TestCase):
         self.assertEqual(amps, 32)
 
 
+class TestFroniusRetry(unittest.TestCase):
+    def setUp(self):
+        self.config = {
+            "FRONIUS_IP": "127.0.0.1",
+            "FRONIUS_EXPORT_IS_POSITIVE": False,
+        }
+
+    def _ok_response(self, p_grid):
+        resp = MagicMock()
+        resp.json.return_value = {"Body": {"Data": {"Site": {"P_Grid": p_grid}}}}
+        return resp
+
+    @patch("solar_home_manager.time.sleep", return_value=None)
+    @patch("solar_home_manager.requests.get")
+    def test_retry_succeeds_on_second_attempt(self, mock_get, _mock_sleep):
+        """A single dropped read (Datamanager Wi-Fi power-save) is recovered by the retry."""
+        import requests as real_requests
+
+        mock_get.side_effect = [
+            real_requests.exceptions.ReadTimeout("timed out"),
+            self._ok_response(-3000.0),
+        ]
+        self.assertEqual(solar_home_manager.get_excess_solar(self.config), 3000.0)
+        self.assertEqual(mock_get.call_count, 2)
+
+    @patch("solar_home_manager.time.sleep", return_value=None)
+    @patch("solar_home_manager.requests.get")
+    def test_returns_none_after_two_failures(self, mock_get, _mock_sleep):
+        """Two consecutive failures still skip the tick safely instead of crashing."""
+        import requests as real_requests
+
+        mock_get.side_effect = real_requests.exceptions.ConnectTimeout("down")
+        self.assertIsNone(solar_home_manager.get_excess_solar(self.config))
+        self.assertEqual(mock_get.call_count, 2)
+
+    @patch("solar_home_manager.requests.get")
+    def test_no_retry_when_first_attempt_succeeds(self, mock_get):
+        """The happy path makes exactly one request (no pointless retry delay)."""
+        mock_get.return_value = self._ok_response(-1500.0)
+        self.assertEqual(solar_home_manager.get_excess_solar(self.config), 1500.0)
+        self.assertEqual(mock_get.call_count, 1)
+
+
 class TestProgressiveRolloutAnd4TierPriority(unittest.TestCase):
     def setUp(self):
         self.original_cache_path = solar_home_manager.CACHE_PATH

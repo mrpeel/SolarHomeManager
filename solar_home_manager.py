@@ -1109,17 +1109,32 @@ def get_daylight_window(config, override_time=None):
 
 
 def get_excess_solar(config, mock_power=None):
-    """Fetches real-time excess grid power from Fronius inverter."""
+    """Fetches real-time excess grid power from Fronius inverter.
+
+    One immediate retry: the Datamanager's Wi-Fi power-save routinely drops
+    the first request of a tick (read timeout at 10s), while the retry a
+    second later succeeds. Logs only the final outcome to avoid noise.
+    """
     if mock_power is not None:
         p_grid = mock_power
     else:
-        try:
-            url = f"http://{config['FRONIUS_IP']}/solar_api/v1/GetPowerFlowRealtimeData.fcgi"
-            response = requests.get(url, timeout=10)
-            data = response.json()
-            p_grid = data["Body"]["Data"]["Site"]["P_Grid"]
-        except Exception as e:
-            print(f"[{dt.now()}] Telemetry fetch error from Fronius: {e}")
+        p_grid = None
+        last_err = None
+        for attempt in (1, 2):
+            try:
+                url = f"http://{config['FRONIUS_IP']}/solar_api/v1/GetPowerFlowRealtimeData.fcgi"
+                response = requests.get(url, timeout=10)
+                data = response.json()
+                p_grid = data["Body"]["Data"]["Site"]["P_Grid"]
+                if attempt == 2:
+                    print(f"[{dt.now()}] Fronius telemetry recovered on retry (attempt 2/2).")
+                break
+            except Exception as e:
+                last_err = e
+                if attempt == 1:
+                    time.sleep(1.0)
+        if p_grid is None:
+            print(f"[{dt.now()}] Telemetry fetch error from Fronius (2 attempts): {last_err}")
             return None
 
     if config["FRONIUS_EXPORT_IS_POSITIVE"]:
@@ -1402,19 +1417,19 @@ def calculate_target_amps(excess_watts, config):
     min_power_threshold = config["MIN_AMPS"] * config["VOLTAGE"]
 
     print(
-        f"[{dt.now()}] Solar Control Inputs: Excess = {excess_watts} W, Buffer = {config['BUFFER_WATTS']} W, Usable surplus = {usable_watts} W, System Voltage = {config['VOLTAGE']} V"
+        f"[{dt.now()}] Solar Control Inputs: Excess = {excess_watts:.1f} W, Buffer = {config['BUFFER_WATTS']} W, Usable surplus = {usable_watts:.1f} W, System Voltage = {config['VOLTAGE']} V"
     )
 
     if usable_watts < min_power_threshold:
         print(
-            f"[{dt.now()}] Solar Control Decision: Usable surplus ({usable_watts} W) is below minimum charge threshold ({min_power_threshold} W)."
+            f"[{dt.now()}] Solar Control Decision: Usable surplus ({usable_watts:.1f} W) is below minimum charge threshold ({min_power_threshold} W)."
         )
         return False, config["MIN_AMPS"]
 
     calculated_amps = int(usable_watts // config["VOLTAGE"])
     target_amps = min(config["MAX_AMPS"], max(config["MIN_AMPS"], calculated_amps))
     print(
-        f"[{dt.now()}] Solar Control Decision: Usable surplus ({usable_watts} W) yields calculated amps = {calculated_amps} A. Target current = {target_amps} A (Bounded: [{config['MIN_AMPS']} A, {config['MAX_AMPS']} A])."
+        f"[{dt.now()}] Solar Control Decision: Usable surplus ({usable_watts:.1f} W) yields calculated amps = {calculated_amps} A. Target current = {target_amps} A (Bounded: [{config['MIN_AMPS']} A, {config['MAX_AMPS']} A])."
     )
     return True, target_amps
 
