@@ -195,6 +195,7 @@ def load_config():
         "PREHEAT_FORECAST_MAX_C": 16.0,
         "PREHEAT_FORECAST_MIN_C": 8.0,
         "PREHEAT_TARGET_C": 22.0,
+        "HEAT_SUPPRESS_FORECAST_MAX_C": 26.0,
         "NIGHT_PURGE_DELTA_C": 2.0,
         "NIGHT_PURGE_MIN_OUTDOOR_C": 15.0,
         "FAN_LOW_TEMP_C": 21.0,
@@ -1964,6 +1965,27 @@ def evaluate_tier1_immediate_comfort(
         active_tier == "TIER1_COMFORT_HEAT" and min_temp_c < (heat_target - 0.3)
     )
     if needs_heating:
+        # Forecast gate: never burn compressor energy heating on mornings
+        # ahead of hot days; the sun warms the house for free within hours.
+        try:
+            forecast_max = (
+                float(weather_state.get("forecast_max_c", 0.0))
+                if weather_state
+                else 0.0
+            )
+        except (TypeError, ValueError):
+            forecast_max = 0.0
+        suppress_at = float(config.get("HEAT_SUPPRESS_FORECAST_MAX_C", 26.0))
+        if weather_state is not None and forecast_max >= suppress_at:
+            return False, {
+                "tier": "IDLE",
+                "power": "OFF",
+                "reason": (
+                    f"Morning heating suppressed (forecast max {forecast_max:.1f}°C "
+                    f">= {suppress_at:.1f}°C, house warms naturally): "
+                    f"{min_zone_name}={min_temp_c:.1f}°C <= {heat_trigger:.1f}°C"
+                ),
+            }
         zone_cmds = build_zone_plan_for_mode("HEAT", False, now, live_zones, config)
         return True, {
             "tier": "TIER1_COMFORT_HEAT",

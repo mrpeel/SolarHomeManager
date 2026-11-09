@@ -314,6 +314,7 @@ class TestProgressiveRolloutAnd4TierPriority(unittest.TestCase):
             "PREHEAT_FORECAST_MAX_C": 16.0,
             "PREHEAT_FORECAST_MIN_C": 8.0,
             "PREHEAT_TARGET_C": 22.0,
+            "HEAT_SUPPRESS_FORECAST_MAX_C": 26.0,
             "NIGHT_PURGE_DELTA_C": 2.0,
             "NIGHT_PURGE_MIN_OUTDOOR_C": 15.0,
             "ZONES": make_default_zones_config(),
@@ -844,6 +845,43 @@ class TestProgressiveRolloutAnd4TierPriority(unittest.TestCase):
         self.assertTrue(day_heat_need)
         self.assertEqual(day_heat_plan["tier"], "TIER1_COMFORT_HEAT")
         self.assertEqual(day_heat_plan["setpoint_c"], 20.0)
+
+    def test_heat_suppressed_ahead_of_hot_day(self):
+        """HK at 17.7C on a 28C-forecast morning stays IDLE; the sun warms the house for free."""
+        tz = ZoneInfo("Australia/Sydney")
+        morning = dt(2026, 11, 10, 8, 15, 0, tzinfo=tz)
+        cache = solar_home_manager.read_cache()
+        at_cold = make_mock_airtouch_state(ac_power="OFF", living_temp=17.7)
+        wx_hot = {
+            "outdoor_temp_c": 18.0,
+            "cloud_cover_pct": 10.0,
+            "forecast_max_c": 28.0,
+            "forecast_min_c": 16.0,
+        }
+        needed, plan = solar_home_manager.evaluate_tier1_immediate_comfort(
+            morning, at_cold, wx_hot, cache, self.base_config
+        )
+        self.assertFalse(needed)
+        self.assertEqual(plan["tier"], "IDLE")
+        self.assertIn("suppressed", plan["reason"])
+
+    def test_heat_still_fires_on_mild_day(self):
+        """Same 17.7C room with a 20C forecast still heats; suppression is forecast-gated only."""
+        tz = ZoneInfo("Australia/Sydney")
+        morning = dt(2026, 11, 10, 8, 15, 0, tzinfo=tz)
+        cache = solar_home_manager.read_cache()
+        at_cold = make_mock_airtouch_state(ac_power="OFF", living_temp=17.7)
+        wx_mild = {
+            "outdoor_temp_c": 15.0,
+            "cloud_cover_pct": 40.0,
+            "forecast_max_c": 20.0,
+            "forecast_min_c": 12.0,
+        }
+        needed, plan = solar_home_manager.evaluate_tier1_immediate_comfort(
+            morning, at_cold, wx_mild, cache, self.base_config
+        )
+        self.assertTrue(needed)
+        self.assertEqual(plan["tier"], "TIER1_COMFORT_HEAT")
 
     def test_fan_circulation_graduated_speeds(self):
         """Daytime heat band drives fan speed without the compressor: 21C LOW, 22C MEDIUM, 23C HIGH."""
