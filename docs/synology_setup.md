@@ -169,5 +169,5 @@ You can advance or roll back stages at any time simply by editing `"ROLLOUT_STAG
   "DRY_RUN_TESLA": false,
   "DRY_RUN_CLIMATE": false
   ```
-- **Behavior:** Live AirTouch 5 control and live Tesla solar charging operate together under the 4-tier priority hierarchy (`Immediate Comfort` $\rightarrow$ `EV < 90%` $\rightarrow$ `Solar Pre-Cool/Heat` $\rightarrow$ `EV 90–100%`), with automatic 120-minute lockout whenever anyone adjusts the AirTouch wall tablet or phone app manually.
+- **Behavior:** Live AirTouch 5 control and live Tesla solar charging operate together under the 4-tier priority hierarchy (`Immediate Comfort` $\rightarrow$ `EV < 90%` $\rightarrow$ `Solar Pre-Cool/Heat` $\rightarrow$ `EV 90–100%`), with automatic 90-minute lockout whenever anyone adjusts the AirTouch wall tablet or phone app manually.
 - **Instant Rollback:** Setting `"ROLLOUT_STAGE": 3` (or `1`) in `config.json` immediately disables live HVAC control on the next tick while keeping EV charging active.

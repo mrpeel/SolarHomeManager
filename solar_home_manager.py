@@ -177,7 +177,7 @@ def load_config():
         "HVAC_ESTIMATED_WATTS": 2000,
         "HVAC_MIN_ON_MINUTES": 15,
         "HVAC_MIN_OFF_MINUTES": 6,
-        "HVAC_MANUAL_OVERRIDE_MINUTES": 120,
+        "HVAC_MANUAL_OVERRIDE_MINUTES": 90,
         "WEATHER_REFRESH_MINUTES": 30,
         "DAYTIME_HOURS": [7, 22],
         "DAY_COMFORT_MIN_C": 18.0,
@@ -1568,7 +1568,7 @@ def detect_manual_airtouch_override(
             )
 
     if mismatch_reasons:
-        hold_mins = float(config.get("HVAC_MANUAL_OVERRIDE_MINUTES", 120))
+        hold_mins = float(config.get("HVAC_MANUAL_OVERRIDE_MINUTES", 90))
         until_dt = now + datetime.timedelta(minutes=hold_mins)
         cache["airtouch_manual_override_until"] = until_dt.isoformat()
         if live_ac.get("power") == "OFF" and cache.get("hvac_active_tier") in (

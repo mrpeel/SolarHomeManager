@@ -26,7 +26,7 @@ Controlled via `"ROLLOUT_STAGE"` (`1..4`) in `config.json`:
 ## Critical Engineering Invariants
 1. **Single-File Core Structure (`solar_home_manager.py`) & Python 3.9-Compatible Syntax:** Avoid Python 3.10+ syntax (`match/case`, `@dataclass(slots=True)`) so the code still parses on 3.9; the production venv should be 3.11+ because `tesla-fleet-api>=1.5.0` (live signed Tesla commands) requires Python ≥ 3.10.
 2. **Fault Isolation:** Any failure in AirTouch 5 TCP socket communication or Weather API fetching must be caught and logged without interrupting Tesla solar charging.
-3. **Manual Override Preemption:** If live AirTouch 5 state differs from `airtouch_last_dispatched`, lock out automated HVAC commands for `HVAC_MANUAL_OVERRIDE_MINUTES` (`120 mins`) while continuing to regulate EV solar charging around the manual AC load.
+3. **Manual Override Preemption:** If live AirTouch 5 state differs from `airtouch_last_dispatched`, lock out automated HVAC commands for `HVAC_MANUAL_OVERRIDE_MINUTES` (`90 mins`) while continuing to regulate EV solar charging around the manual AC load.
 4. **Compressor Short-Cycle & Spill Protection:** Enforce `HVAC_MIN_ON_MINUTES` (`15m`), `HVAC_MIN_OFF_MINUTES` (`6m`), and `MIN_TOTAL_DAMPER_PCT` (`120%`).
 
 ## Commands & Verification

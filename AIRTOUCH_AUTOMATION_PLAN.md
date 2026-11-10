@@ -443,7 +443,7 @@ Instead of holding a permanent socket open 24/7, each Task Scheduler invocation 
 1. **Read Current State:** Polls `0x23` (AC Status) and `0x21` (Zone Status).
 2. **Detect Manual Human Override:**
    Compares live AirTouch state against `cache["airtouch_last_dispatched"]`:
-   - If the human user changed AC Power, Mode, Setpoint, or turned a Zone On/Off via the wall tablet or smartphone app since the last run, the orchestrator sets `cache["airtouch_manual_override_until"] = now + 120 mins`.
+   - If the human user changed AC Power, Mode, Setpoint, or turned a Zone On/Off via the wall tablet or smartphone app since the last run, the orchestrator sets `cache["airtouch_manual_override_until"] = now + 90 mins`.
    - While in `MANUAL_OVERRIDE`, the script **never** overwrites AirTouch settings, and treats active AC operation as mandatory household load (protecting comfort while still scaling Tesla solar charging around the user's manual AC usage).
 3. **Dispatch Delta Commands Only:**
    If not in manual override and the decision engine requires an AC or Zone change, sends a single batched `0x22` (AC Control) and/or `0x20` (Zone Control) frame, waits `0.5s` for the console's `0x21`/`0x23` acknowledgement frame, updates `cache["airtouch_last_dispatched"]`, and closes the socket cleanly.
@@ -495,7 +495,7 @@ All telemetry is gathered in a single pass at the start of `run_orchestrator_loo
   "HVAC_ESTIMATED_WATTS": 2000,
   "HVAC_MIN_ON_MINUTES": 15,
   "HVAC_MIN_OFF_MINUTES": 6,
-  "HVAC_MANUAL_OVERRIDE_MINUTES": 120,
+  "HVAC_MANUAL_OVERRIDE_MINUTES": 90,
   "COMFORT_COOL_TRIGGER_C": 24.5,
   "COMFORT_COOL_TARGET_C": 23.0,
   "COMFORT_HEAT_TRIGGER_C": 18.5,

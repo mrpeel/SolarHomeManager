@@ -296,7 +296,7 @@ class TestProgressiveRolloutAnd4TierPriority(unittest.TestCase):
             "HVAC_ESTIMATED_WATTS": 2000,
             "HVAC_MIN_ON_MINUTES": 15,
             "HVAC_MIN_OFF_MINUTES": 6,
-            "HVAC_MANUAL_OVERRIDE_MINUTES": 120,
+            "HVAC_MANUAL_OVERRIDE_MINUTES": 90,
             "WEATHER_REFRESH_MINUTES": 30,
             "DAYTIME_HOURS": [7, 22],
             "DAY_COMFORT_MIN_C": 18.0,
@@ -685,7 +685,7 @@ class TestProgressiveRolloutAnd4TierPriority(unittest.TestCase):
     ):
         """
         If the user manually changes the AirTouch state on the wall tablet,
-        HVAC automation locks out for 120 minutes while EV charging continues normally.
+        HVAC automation locks out for 90 minutes while EV charging continues normally.
         """
         self.base_config["ROLLOUT_STAGE"] = 4
         self.base_config["DRY_RUN_CLIMATE"] = False

@@ -163,7 +163,7 @@ Household schedules vary from day to day (weekends, public holidays, working fro
 
 1. **Per-Zone Manual Override Detection (`detect_manual_airtouch_override`):**
    - `state_cache.json` tracks the last dispatched `power` and `setpoint_c` of **every individual zone (`0..4`)** as well as the master AC unit.
-   - If someone turns their room `ON` (or adjusts its temperature setpoint) on the wall tablet or AirTouch phone app, **SolarHomeManager** immediately detects the zone change on the next tick and locks out automated HVAC overrides for `HVAC_MANUAL_OVERRIDE_MINUTES` (`120 minutes`). It will **never** turn their room back off 5 minutes later.
+   - If someone turns their room `ON` (or adjusts its temperature setpoint) on the wall tablet or AirTouch phone app, **SolarHomeManager** immediately detects the zone change on the next tick and locks out automated HVAC overrides for `HVAC_MANUAL_OVERRIDE_MINUTES` (`90 minutes`). It will **never** turn their room back off 5 minutes later.
 2. **Non-Destructive Temperature Setback Instead of Forced Zone Shutoff:**
    - Because all 5 of your zones (e.g. Bedroom 1, Living, Bedroom 2, Bedroom 3, Study — named in `.env` via `ZONE_0_NAME`…`ZONE_4_NAME`) have paired **ITC room temperature sensors** and operate in AirTouch 5's `"TEMPERATURE"` mode, the AirTouch 5 **automatically closes a room's damper to `0%`** whenever that room doesn't need heating or cooling.
    - Instead of rudely forcing a bedroom's power to `OFF` during weekday daytime hours, **SolarHomeManager** leaves `ON` zones `ON` in `"TEMPERATURE"` mode and applies a gentle **`1.5°C` unoccupied setback** (e.g., `23.5°C` instead of `22.0°C` when cooling).
@@ -203,7 +203,7 @@ Because the household uses a mix of Mac, Windows, and Chromebooks (including a m
 
 1. **Manual Tablet / App Override Preemption:**
    - Before evaluating automated HVAC rules, `detect_manual_airtouch_override()` compares live AirTouch 5 status against `cache["airtouch_last_dispatched"]`.
-   - If a human changed AC Power, Mode, or Setpoint on the wall tablet or smartphone app, automation locks out for `HVAC_MANUAL_OVERRIDE_MINUTES` (`120 minutes`).
+   - If a human changed AC Power, Mode, or Setpoint on the wall tablet or smartphone app, automation locks out for `HVAC_MANUAL_OVERRIDE_MINUTES` (`90 minutes`).
    - If the user manually turns the AC `OFF` during Tier 3 Solar Pre-Cooling/Pre-Heating, solar banking is cancelled for the remainder of that calendar day.
    - During a manual override, EV solar charging continues operating normally around the manual AC load.
 2. **Compressor Short-Cycle Protection:**
