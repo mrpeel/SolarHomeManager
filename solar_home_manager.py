@@ -192,6 +192,8 @@ def load_config():
         "UNOCCUPIED_HEAT_SETBACK_C": -1.5,
         "PRECOOL_FORECAST_MAX_C": 30.0,
         "PRECOOL_TARGET_C": 21.0,
+        "TIER3_PRECOOL_OUTDOOR_C": 29.0,
+        "TIER3_PRECOOL_HOLD_DROP_C": 0.5,
         "PREHEAT_FORECAST_MAX_C": 16.0,
         "PREHEAT_FORECAST_MIN_C": 8.0,
         "PREHEAT_TARGET_C": 22.0,
@@ -202,6 +204,12 @@ def load_config():
         "FAN_MED_TEMP_C": 22.0,
         "FAN_HIGH_TEMP_C": 23.0,
         "FAN_OFF_DIFFERENTIAL_C": 0.5,
+        "FAN_HOT_SUPPRESS_OUTDOOR_C": 26.0,
+        "FAN_SUPPRESS_OUTDOOR_DELTA_C": 1.0,
+        "HOT_DAY_COOL_TRIGGER_OFFSET_C": 1.0,
+        "WARM_SUNNY_PRECOOL_FORECAST_C": 27.0,
+        "WARM_SUNNY_PRECOOL_OUTDOOR_C": 25.0,
+        "WARM_SUNNY_PRECOOL_TARGET_C": 22.0,
         "MIN_TOTAL_DAMPER_PCT": 120,
         "ZONES": {
             "0": {
@@ -1835,9 +1843,16 @@ def evaluate_tier1_immediate_comfort(
 
     Below the compressor triggers, graduated fan-only circulation (21°C low,
     22°C medium, 23°C high with 0.5°C switch-off hysteresis) keeps air moving
-    for comfort at negligible (~80W) draw. Compressor modes always take
-    precedence at their triggers; Tier 3 solar banking may supersede fan-only
-    operation but never the reverse.
+    for comfort at negligible (~80W) draw — but ONLY when outside air is
+    actually cooler than the room. Ducts run through the hot ceiling void,
+    so on warm/sunny days fan-only circulation recirculates roof-heated air
+    and makes the house hotter: it is suppressed when outdoor >=
+    FAN_HOT_SUPPRESS_OUTDOOR_C (26°C) or within
+    FAN_SUPPRESS_OUTDOOR_DELTA_C (1°C) of the hottest room. Compressor modes
+    always take precedence at their triggers; on warm/sunny days the cooling
+    trigger itself pulls back by HOT_DAY_COOL_TRIGGER_OFFSET_C (1°C) so free
+    solar runs the compressor instead of the fan. Tier 3 solar banking may
+    supersede fan-only operation but never the reverse.
     """
     zones_cfg = config.get("ZONES", {})
     live_zones = airtouch_state.get("zones", {})
@@ -1864,6 +1879,43 @@ def evaluate_tier1_immediate_comfort(
     cool_target = band["cool_target_c"]
     heat_trigger = band["min_c"]
     heat_target = band["heat_target_c"]
+
+    # Warm/sunny pull-back: on days heading for heat with an already-warm
+    # outdoors, start the compressor earlier (e.g. day band 24 -> 23°C) so
+    # peak solar does useful cooling instead of the fan stirring hot
+    # ceiling-duct air. Gated on weather only (Tier 1 is mandatory load).
+    try:
+        _fc_max = (
+            float(weather_state.get("forecast_max_c"))
+            if weather_state and weather_state.get("forecast_max_c") is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        _fc_max = None
+    try:
+        _od_now = (
+            float(weather_state.get("outdoor_temp_c"))
+            if weather_state and weather_state.get("outdoor_temp_c") is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        _od_now = None
+    _warm_sunny_day = (
+        _fc_max is not None
+        and _od_now is not None
+        and _fc_max >= float(config.get("WARM_SUNNY_PRECOOL_FORECAST_C", 27.0))
+        and _od_now >= float(config.get("WARM_SUNNY_PRECOOL_OUTDOOR_C", 25.0))
+    )
+    _cool_trigger_note = ""
+    if _warm_sunny_day:
+        _offset = float(config.get("HOT_DAY_COOL_TRIGGER_OFFSET_C", 1.0))
+        _pulled = cool_trigger - _offset
+        # Never pull the trigger at/below the cool target (+0.5°C guard).
+        cool_trigger = max(_pulled, cool_target + 0.5)
+        _cool_trigger_note = (
+            f" (warm/sunny pull-back -{_offset:.1f}°C, "
+            f"forecast {_fc_max:.0f}°C/outdoor {_od_now:.0f}°C)"
+        )
 
     # Check Cooling Trigger (with hysteresis if already in TIER1_COMFORT_COOL or TIER1_NIGHT_PURGE)
     needs_cooling = max_temp_c >= cool_trigger or (
@@ -1907,7 +1959,7 @@ def evaluate_tier1_immediate_comfort(
             "zone_commands": zone_cmds,
             "draws_compressor_power": True,
             "reason": (
-                f"Immediate cooling needed ({band['period']} band {heat_trigger:.0f}-{cool_trigger:.0f}°C): "
+                f"Immediate cooling needed ({band['period']} band {heat_trigger:.0f}-{cool_trigger:.0f}°C{_cool_trigger_note}): "
                 f"{max_zone_name}={max_temp_c:.1f}°C >= {cool_trigger:.1f}°C -> Target {cool_target:.1f}°C"
             ),
         }
@@ -1917,6 +1969,35 @@ def evaluate_tier1_immediate_comfort(
     # compressor action is needed. Thresholds shift down by the switch-off
     # differential while already circulating, giving 0.5°C hysteresis so the
     # fan does not flutter at a boundary.
+    # DUCT-HEAT GUARD: supply air travels through the ceiling void, which on
+    # warm/sunny days runs hotter than ambient. Running FAN then heats the
+    # house while dumping free solar to the grid, so suppress circulation and
+    # return IDLE — the caller then evaluates Tier 3 solar pre-cooling, which
+    # uses the peak solar in the compressor instead.
+    _fan_outdoor_c = _od_now
+    if _fan_outdoor_c is not None:
+        _hot_suppress_at = float(config.get("FAN_HOT_SUPPRESS_OUTDOOR_C", 26.0))
+        _fan_delta = float(config.get("FAN_SUPPRESS_OUTDOOR_DELTA_C", 1.0))
+        if _fan_outdoor_c >= _hot_suppress_at:
+            return False, {
+                "tier": "IDLE",
+                "power": "OFF",
+                "reason": (
+                    f"Fan suppressed (duct-heat guard): outdoor {_fan_outdoor_c:.1f}°C >= "
+                    f"{_hot_suppress_at:.1f}°C ceiling-duct air would heat "
+                    f"{max_zone_name}={max_temp_c:.1f}°C; Tier 3 solar pre-cool may fire instead"
+                ),
+            }
+        if _fan_outdoor_c >= (max_temp_c - _fan_delta):
+            return False, {
+                "tier": "IDLE",
+                "power": "OFF",
+                "reason": (
+                    f"Fan suppressed (no cooling delta): outdoor {_fan_outdoor_c:.1f}°C within "
+                    f"{_fan_delta:.1f}°C of {max_zone_name}={max_temp_c:.1f}°C; "
+                    f"fan would not cool"
+                ),
+            }
     fan_low = float(config.get("FAN_LOW_TEMP_C", 21.0))
     fan_med = float(config.get("FAN_MED_TEMP_C", 22.0))
     fan_high = float(config.get("FAN_HIGH_TEMP_C", 23.0))
@@ -2020,6 +2101,10 @@ def evaluate_tier3_solar_banking(
     """
     Evaluates Priority 3: Home Solar Pre-Cooling / Pre-Heating (Thermal Banking)
     in preparation for forecast hot/cold weather using excess solar.
+    The pre-cool target blends forecast AND current outdoor heat (a 31°C
+    afternoon banks deep even on a 29°C-forecast day), and an active pre-cool
+    run latches until the rooms fall below target - HOLD_DROP so free solar
+    banks mass instead of cycling at the comfort line.
     """
     if not weather_state:
         return False, {"tier": "IDLE", "power": "OFF", "reason": "No weather forecast available"}
@@ -2072,9 +2157,56 @@ def evaluate_tier3_solar_banking(
     max_prio_temp = max(priority_temps)
     min_prio_temp = min(priority_temps)
 
-    # Check Solar Pre-Cool
+    # Check Solar Pre-Cool. The effective target is chosen from CURRENT heat
+    # as well as forecast heat, so a 31°C afternoon with a 29°C forecast
+    # still banks deep instead of stopping at comfort:
+    #   - deep (21.0°C): forecast >= 30°C, OR current outdoor >= 29°C;
+    #   - warm/sunny (22.0°C): forecast >= 27°C with outdoor >= 25°C.
+    # Start threshold is target + 0.6°C; once running, the run latches until
+    # the rooms fall to target - HOLD_DROP (0.5°C) so abundant solar banks
+    # thermal mass instead of short-cycling at the comfort line while the
+    # house is still being driven hot from outside.
+    try:
+        _outdoor_c = (
+            float(weather_state.get("outdoor_temp_c"))
+            if weather_state.get("outdoor_temp_c") is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        _outdoor_c = None
+    warm_forecast_c = float(config.get("WARM_SUNNY_PRECOOL_FORECAST_C", 27.0))
+    warm_outdoor_c = float(config.get("WARM_SUNNY_PRECOOL_OUTDOOR_C", 25.0))
+    warm_target_c = float(config.get("WARM_SUNNY_PRECOOL_TARGET_C", 22.0))
+    deep_outdoor_c = float(config.get("TIER3_PRECOOL_OUTDOOR_C", 29.0))
+    hold_drop_c = float(config.get("TIER3_PRECOOL_HOLD_DROP_C", 0.5))
+    precool_target_eff: Optional[float] = None
+    precool_label = ""
     if forecast_max_c >= precool_forecast_c:
-        threshold_temp = (precool_target_c + 0.2) if active_tier == "TIER3_PRECOOL" else (precool_target_c + 0.6)
+        precool_target_eff = precool_target_c
+        precool_label = (
+            f"Forecast Max={forecast_max_c:.1f}°C (>= {precool_forecast_c:.1f}°C)"
+        )
+    elif _outdoor_c is not None and _outdoor_c >= deep_outdoor_c:
+        precool_target_eff = precool_target_c
+        precool_label = (
+            f"Outdoor={_outdoor_c:.1f}°C (>= {deep_outdoor_c:.1f}°C currently hot)"
+        )
+    elif (
+        _outdoor_c is not None
+        and forecast_max_c >= warm_forecast_c
+        and _outdoor_c >= warm_outdoor_c
+    ):
+        precool_target_eff = warm_target_c
+        precool_label = (
+            f"warm/sunny: Forecast Max={forecast_max_c:.1f}°C "
+            f"(>= {warm_forecast_c:.1f}°C), Outdoor={_outdoor_c:.1f}°C "
+            f"(>= {warm_outdoor_c:.1f}°C)"
+        )
+    if precool_target_eff is not None:
+        if active_tier == "TIER3_PRECOOL":
+            threshold_temp = precool_target_eff - hold_drop_c
+        else:
+            threshold_temp = precool_target_eff + 0.6
         if max_prio_temp > threshold_temp:
             zone_cmds = build_zone_plan_for_mode("COOL", True, now, live_zones, config)
             return True, {
@@ -2082,12 +2214,13 @@ def evaluate_tier3_solar_banking(
                 "power": "ON",
                 "mode": "COOL",
                 "fan_speed": "MEDIUM",
-                "setpoint_c": precool_target_c,
+                "setpoint_c": precool_target_eff,
                 "zone_commands": zone_cmds,
                 "draws_compressor_power": True,
                 "reason": (
-                    f"Solar Pre-Cool: Forecast Max={forecast_max_c:.1f}°C (>= {precool_forecast_c:.1f}°C), "
-                    f"Max Priority Zone={max_prio_temp:.1f}°C -> Target {precool_target_c:.1f}°C "
+                    f"Solar Pre-Cool ({precool_label}), "
+                    f"Max Priority Zone={max_prio_temp:.1f}°C "
+                    f"-> Target {precool_target_eff:.1f}°C "
                     f"(Solar={available_solar_watts:.0f}W)"
                 ),
             }
@@ -2864,6 +2997,10 @@ def _finalize_hvac_execution(
         return
 
     # Stage 4: Live Command Dispatch
+    print(
+        f"[{now}] [HVAC] Tier={hvac_plan.get('tier')} | Reason={hvac_plan.get('reason')} | "
+        f"AC={ac_cmd}, Zones={len(zone_cmds)} zone(s)"
+    )
     if ac_cmd or zone_cmds:
         if dispatch_airtouch_commands(
             config, ac_cmd, zone_cmds, dry_run_climate=flags["dry_run_climate"]

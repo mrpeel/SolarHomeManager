@@ -523,11 +523,12 @@ class TestProgressiveRolloutAnd4TierPriority(unittest.TestCase):
     ):
         """
         Priority 2 (EV < 90% SoC) beats Priority 3 (Solar Pre-Cooling):
-        Home is at 22.5°C (fan-circulation band), Forecast is hot (33°C),
-        Solar is 3000W, EV is at 70% SoC.
+        Home is at 22.5°C, Forecast is hot (33°C), Solar is 3000W, EV is at 70% SoC.
         EV claims 11A (2640W), leaving only 360W (< 2000W needed for Tier 3 Pre-Cool).
-        Result: EV charges at 11A, Tier 3 Pre-Cool does NOT start, and the fan
-        circulates (MEDIUM) for comfort while the EV charges.
+        Result: EV charges at 11A, Tier 3 Pre-Cool does NOT start.
+        On a 27°C-outdoor day fan circulation is suppressed by the duct-heat
+        guard (ceiling ducts would re-heat the rooms), so HVAC stays IDLE/OFF
+        instead of blowing warm air while the EV charges.
         """
         self.base_config["ROLLOUT_STAGE"] = 4
         self.base_config["DRY_RUN_CLIMATE"] = False
@@ -565,12 +566,10 @@ class TestProgressiveRolloutAnd4TierPriority(unittest.TestCase):
             mock_weather=wx_state,
         )
 
-        mock_dispatch_at.assert_called_once()
-        dispatched_ac_cmd = mock_dispatch_at.call_args[0][1]
-        self.assertEqual(dispatched_ac_cmd.get("mode"), "FAN")
-        self.assertEqual(dispatched_ac_cmd.get("fan_speed"), "MEDIUM")
+        # Fan suppressed (outdoor 27°C >= 26°C guard): no dispatch, AC stays OFF.
+        mock_dispatch_at.assert_not_called()
         cache = solar_home_manager.read_cache()
-        self.assertEqual(cache["hvac_active_tier"], "TIER1_FAN_CIRCULATE")
+        self.assertEqual(cache["hvac_active_tier"], "IDLE")
         self.assertTrue(cache["charging"])
         self.assertEqual(cache["amps"], 11)
 
@@ -1063,6 +1062,169 @@ class TestProgressiveRolloutAnd4TierPriority(unittest.TestCase):
         self.assertTrue(override_active)
         self.assertIn("Bedroom 1 power OFF->ON", reason)
         self.assertIsNotNone(cache["airtouch_manual_override_until"])
+
+    def test_fan_suppressed_on_hot_sunny_day_instead_of_blowing_warm_air(self):
+        """29°C-forecast sunny day: 23.2°C indoor must NOT run FAN HIGH (duct air would heat)."""
+        tz = ZoneInfo("Australia/Sydney")
+        midday = dt(2026, 11, 10, 13, 0, 0, tzinfo=tz)
+        cache = solar_home_manager.read_cache()
+        # 23.2°C indoor would previously run FAN HIGH; outdoor 28°C means the
+        # ceiling-duct supply air is hotter than the rooms.
+        at_state = make_mock_airtouch_state(ac_power="OFF", living_temp=23.2)
+        wx_state = {
+            "outdoor_temp_c": 28.0,
+            "cloud_cover_pct": 5.0,
+            "forecast_max_c": 29.0,
+            "forecast_min_c": 17.0,
+        }
+        needed, plan = solar_home_manager.evaluate_tier1_immediate_comfort(
+            midday, at_state, wx_state, cache, self.base_config
+        )
+        # Tier 1 cooling trigger pulls back 24 -> 23°C on warm/sunny days, so
+        # 23.2°C now fires the compressor (uses peak solar) instead of the fan.
+        self.assertTrue(needed)
+        self.assertEqual(plan["tier"], "TIER1_COMFORT_COOL")
+        self.assertEqual(plan["mode"], "COOL")
+
+    def test_fan_suppressed_idle_when_below_pulled_back_trigger(self):
+        """22.5°C indoor on a 29°C sunny day: fan suppressed, AC stays OFF (Tier 3 may bank)."""
+        tz = ZoneInfo("Australia/Sydney")
+        midday = dt(2026, 11, 10, 13, 0, 0, tzinfo=tz)
+        cache = solar_home_manager.read_cache()
+        at_state = make_mock_airtouch_state(ac_power="OFF", living_temp=22.5)
+        wx_state = {
+            "outdoor_temp_c": 28.0,
+            "cloud_cover_pct": 5.0,
+            "forecast_max_c": 29.0,
+            "forecast_min_c": 17.0,
+        }
+        needed, plan = solar_home_manager.evaluate_tier1_immediate_comfort(
+            midday, at_state, wx_state, cache, self.base_config
+        )
+        self.assertFalse(needed)
+        self.assertEqual(plan["tier"], "IDLE")
+        self.assertIn("Fan suppressed", plan["reason"])
+
+    def test_fan_still_runs_on_mild_day(self):
+        """22.5°C indoor with 20°C outdoor: FAN MEDIUM still runs (no duct-heat risk)."""
+        tz = ZoneInfo("Australia/Sydney")
+        midday = dt(2026, 10, 21, 14, 0, 0, tzinfo=tz)
+        cache = solar_home_manager.read_cache()
+        at_state = make_mock_airtouch_state(ac_power="OFF", living_temp=22.5)
+        wx_state = {
+            "outdoor_temp_c": 20.0,
+            "cloud_cover_pct": 40.0,
+            "forecast_max_c": 22.0,
+            "forecast_min_c": 14.0,
+        }
+        needed, plan = solar_home_manager.evaluate_tier1_immediate_comfort(
+            midday, at_state, wx_state, cache, self.base_config
+        )
+        self.assertTrue(needed)
+        self.assertEqual(plan["tier"], "TIER1_FAN_CIRCULATE")
+        self.assertEqual(plan["fan_speed"], "MEDIUM")
+
+    def test_warm_sunny_tier3_precool_fires_below_30_forecast(self):
+        """29°C forecast + 27°C outdoor + 3kW solar: Tier 3 banks to 22°C (deep 30°C gate missed)."""
+        tz = ZoneInfo("Australia/Sydney")
+        midday = dt(2026, 11, 10, 13, 0, 0, tzinfo=tz)
+        sunset = dt(2026, 11, 10, 19, 40, 0, tzinfo=tz)
+        at_state = make_mock_airtouch_state(ac_power="OFF", living_temp=22.8)
+        wx_state = {
+            "outdoor_temp_c": 27.0,
+            "cloud_cover_pct": 5.0,
+            "forecast_max_c": 29.0,
+            "forecast_min_c": 17.0,
+        }
+        cache = solar_home_manager.read_cache()
+        active, plan = solar_home_manager.evaluate_tier3_solar_banking(
+            midday, sunset, 3000.0, at_state, wx_state, cache, self.base_config
+        )
+        self.assertTrue(active)
+        self.assertEqual(plan["tier"], "TIER3_PRECOOL")
+        self.assertEqual(plan["setpoint_c"], 22.0)
+        self.assertIn("warm/sunny", plan["reason"])
+
+    def test_warm_sunny_tier3_stays_off_without_solar(self):
+        """Same 29°C day but only 800W export: no pre-cool (nothing free to bank)."""
+        tz = ZoneInfo("Australia/Sydney")
+        midday = dt(2026, 11, 10, 13, 0, 0, tzinfo=tz)
+        sunset = dt(2026, 11, 10, 19, 40, 0, tzinfo=tz)
+        at_state = make_mock_airtouch_state(ac_power="OFF", living_temp=23.5)
+        wx_state = {
+            "outdoor_temp_c": 27.0,
+            "cloud_cover_pct": 5.0,
+            "forecast_max_c": 29.0,
+            "forecast_min_c": 17.0,
+        }
+        cache = solar_home_manager.read_cache()
+        active, plan = solar_home_manager.evaluate_tier3_solar_banking(
+            midday, sunset, 800.0, at_state, wx_state, cache, self.base_config
+        )
+        self.assertFalse(active)
+        self.assertEqual(plan["tier"], "IDLE")
+
+    def test_current_outdoor_heat_escalates_to_deep_precool(self):
+        """31°C outside with only a 29°C forecast still banks deep to 21°C (current heat counts)."""
+        tz = ZoneInfo("Australia/Sydney")
+        midday = dt(2026, 11, 10, 14, 0, 0, tzinfo=tz)
+        sunset = dt(2026, 11, 10, 19, 40, 0, tzinfo=tz)
+        # 22.5°C indoor would NOT start the warm/sunny path (entry 22.6°C)...
+        at_state = make_mock_airtouch_state(ac_power="OFF", living_temp=22.5)
+        wx_state = {
+            "outdoor_temp_c": 31.0,
+            "cloud_cover_pct": 5.0,
+            "forecast_max_c": 29.0,
+            "forecast_min_c": 18.0,
+        }
+        cache = solar_home_manager.read_cache()
+        active, plan = solar_home_manager.evaluate_tier3_solar_banking(
+            midday, sunset, 4500.0, at_state, wx_state, cache, self.base_config
+        )
+        self.assertTrue(active)
+        self.assertEqual(plan["tier"], "TIER3_PRECOOL")
+        self.assertEqual(plan["setpoint_c"], 21.0)
+        self.assertIn("currently hot", plan["reason"])
+
+    def test_active_precool_holds_below_target_while_hot(self):
+        """Running pre-cool at 21.1°C indoor (33°C forecast) keeps going — banks to 20.5, not 21.2."""
+        tz = ZoneInfo("Australia/Sydney")
+        midday = dt(2026, 11, 10, 14, 0, 0, tzinfo=tz)
+        sunset = dt(2026, 11, 10, 19, 40, 0, tzinfo=tz)
+        at_state = make_mock_airtouch_state(ac_power="ON", ac_mode="COOL", living_temp=21.1)
+        wx_state = {
+            "outdoor_temp_c": 31.0,
+            "cloud_cover_pct": 5.0,
+            "forecast_max_c": 33.0,
+            "forecast_min_c": 18.0,
+        }
+        cache = solar_home_manager.read_cache()
+        cache["hvac_active_tier"] = "TIER3_PRECOOL"
+        active, plan = solar_home_manager.evaluate_tier3_solar_banking(
+            midday, sunset, 4500.0, at_state, wx_state, cache, self.base_config
+        )
+        self.assertTrue(active)
+        self.assertEqual(plan["tier"], "TIER3_PRECOOL")
+
+    def test_active_precool_releases_once_banked_cold(self):
+        """Running pre-cool at 20.4°C indoor finally releases (below 21.0 - 0.5 hold floor)."""
+        tz = ZoneInfo("Australia/Sydney")
+        midday = dt(2026, 11, 10, 14, 0, 0, tzinfo=tz)
+        sunset = dt(2026, 11, 10, 19, 40, 0, tzinfo=tz)
+        at_state = make_mock_airtouch_state(ac_power="ON", ac_mode="COOL", living_temp=20.4)
+        wx_state = {
+            "outdoor_temp_c": 31.0,
+            "cloud_cover_pct": 5.0,
+            "forecast_max_c": 33.0,
+            "forecast_min_c": 18.0,
+        }
+        cache = solar_home_manager.read_cache()
+        cache["hvac_active_tier"] = "TIER3_PRECOOL"
+        active, plan = solar_home_manager.evaluate_tier3_solar_banking(
+            midday, sunset, 4500.0, at_state, wx_state, cache, self.base_config
+        )
+        self.assertFalse(active)
+        self.assertEqual(plan["tier"], "IDLE")
 
 
 if __name__ == "__main__":

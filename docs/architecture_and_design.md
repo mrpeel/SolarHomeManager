@@ -71,9 +71,9 @@ On every execution tick, energy and climate decisions are evaluated in strict to
 
 | Priority | Tier Name | Trigger Conditions | Power & Control Behavior |
 | :---: | :--- | :--- | :--- |
-| **1** | **Immediate Home Climate Needs** | Occupied zone temperature $\ge \text{COMFORT\_COOL\_TRIGGER\_C}$ (`24.5°C`) or $\le \text{COMFORT\_HEAT\_TRIGGER\_C}$ (`18.5°C`). | • Runs **regardless of solar surplus** (day or night).<br/>• **Differential Night Purge:** If cooling is needed and outdoor temp is $\ge 2.0^\circ\text{C}$ cooler than indoor (and $\ge 15.0^\circ\text{C}$), runs AirTouch 5 in low-draw `FAN` (`HIGH`) mode.<br/>• **Same-Tick Solar Deduction:** If turning the compressor `OFF -> ON`, immediately deducts `2000 W` from $P_{\text{median}}$ so EV charging steps down in the same tick before the compressor ramps up. |
+| **1** | **Immediate Home Climate Needs** | Occupied zone temperature $\ge \text{COMFORT\_COOL\_TRIGGER\_C}$ (`24.5°C`) or $\le \text{COMFORT\_HEAT\_TRIGGER\_C}$ (`18.5°C`). | • Runs **regardless of solar surplus** (day or night).<br/>• **Warm/sunny pull-back:** when BOM forecast $\ge 27.0^\circ\text{C}$ and outdoor $\ge 25.0^\circ\text{C}$, the cooling trigger drops $1.0^\circ\text{C}$ (day `24→23°C`), so peak solar runs the compressor instead of the fan.<br/>• **Duct-heat guard:** fan-only circulation is suppressed when outdoor $\ge 26.0^\circ\text{C}$ or within $1.0^\circ\text{C}$ of the hottest room — ceiling-duct supply air would heat the house.<br/>• **Differential Night Purge:** If cooling is needed and outdoor temp is $\ge 2.0^\circ\text{C}$ cooler than indoor (and $\ge 15.0^\circ\text{C}$), runs AirTouch 5 in low-draw `FAN` (`HIGH`) mode.<br/>• **Same-Tick Solar Deduction:** If turning the compressor `OFF -> ON`, immediately deducts `2000 W` from $P_{\text{median}}$ so EV charging steps down in the same tick before the compressor ramps up. |
 | **2** | **EV Charging Below 90% SoC** | Vehicle connected to Wall Connector at home during daylight and `battery_level < 90%`. | • Receives **first claim** on discretionary solar pool ($P_{\text{after\_tier1}}$).<br/>• Scales dynamically from `5 A` (`1200 W`) to `32 A` (`7680 W`).<br/>• Preempts Tier 3 thermal banking if residual solar after EV $<90\%$ allocation is below `2000 W`. |
-| **3** | **Home Solar Pre-Cool / Pre-Heat** | Daylight banking window (`10:00` to `sunset - 1h`), Tier 1 satisfied, remaining solar $\ge 2000\text{ W}$ (`1500 W` hysteresis once active), and BOM forecast max $\ge 30.0^\circ\text{C}$ (Pre-Cool to `21.0°C`) or $\le 16.0^\circ\text{C}$ / min $\le 8.0^\circ\text{C}$ (Pre-Heat to `22.5°C`). | • Claims `2000 W` of excess solar **before** Tier 4 (`EV 90–100%`) is evaluated.<br/>• Opens priority living/master zones to bank thermal mass in the home ahead of peak afternoon heat or overnight cold. |
+| **3** | **Home Solar Pre-Cool / Pre-Heat** | Daylight banking window (`10:00` to `sunset - 1h`), Tier 1 satisfied, remaining solar $\ge 2000\text{ W}$ (`1500 W` hysteresis once active), and BOM forecast max $\ge 30.0^\circ\text{C}$ (Pre-Cool to `21.0°C`), **or current outdoor $\ge 29.0^\circ\text{C}$** (deep Pre-Cool to `21.0°C` even when the forecast is lower — a 31°C afternoon banks deep on a 29°C-forecast day), or warm/sunny early Pre-Cool (forecast $\ge 27.0^\circ\text{C}$ + outdoor $\ge 25.0^\circ\text{C}$, banks to `22.0°C`), or $\le 16.0^\circ\text{C}$ / min $\le 8.0^\circ\text{C}$ (Pre-Heat to `22.5°C`). **Latched run:** once pre-cooling, it holds until rooms fall to target − `0.5°C` (not target + `0.2°C`), so free solar banks mass instead of cycling at the comfort line while it is still hot outside. | • Claims `2000 W` of excess solar **before** Tier 4 (`EV 90–100%`) is evaluated.<br/>• Opens priority living/master zones to bank thermal mass in the home ahead of peak afternoon heat or overnight cold. |
 | **4** | **EV Top-Off Charging (90–100% SoC)** | Vehicle connected at home during daylight, `90% <= battery_level < charge_limit_soc`, and residual solar after Tier 3 $\ge 1350\text{ W}$ (`1200 W + 150 W buffer`). | • Allocates any remaining excess solar (`5 A..32 A`) to top off the vehicle from `90%` to `100%`. |
 
 ### Coordinated Load-Shed Ordering
@@ -123,12 +123,15 @@ Because an air conditioner cannot maintain a single exact degree without short-c
 ```
 
 Note: the fan band sits *below* the old "upper passive deadband" — rooms that
-previously sat still at 21–24°C now get moving air instead of nothing. The
-compressor still takes precedence at its triggers, and a compressor run/off
-guard (`HVAC_MIN_ON/OFF_MINUTES`, tracked across FAN↔COOL mode changes, not
-just power toggles) prevents short-cycling at the boundaries. Tier 3 solar
-pre-cooling (hot forecast + ≥2000W export) supersedes fan circulation when it
-fires; Tier 4 EV top-off is evaluated on whatever solar remains after it.
+previously sat still at 21–24°C now get moving air instead of nothing, **except
+on warm/sunny days**: supply air runs through the ceiling void, so when outdoor
+$\ge 26.0^\circ\text{C}$ (or within $1.0^\circ\text{C}$ of the hottest room) fan
+circulation is suppressed — it would re-heat the house while free solar is
+dumped to the grid. Suppressed-fan ticks fall through to Tier 3, which
+early-pre-cools to $22.0^\circ\text{C}$ on $\ge 27^\circ\text{C}$-forecast /
+$\ge 25^\circ\text{C}$-outdoor days with $\ge 2000\text{ W}$ export, and the
+Tier 1 cooling trigger itself pulls back $1.0^\circ\text{C}$ (day `24→23°C`) so
+the compressor — not the fan — handles the load on peak solar.
 
 
 ### 5.2 Summary of Temperature Parameters (`config.json`)
@@ -144,7 +147,12 @@ fires; Tier 4 EV top-off is evaluated on whatever solar remains after it.
 | `UNOCCUPIED_HEAT_SETBACK_C` | `-1.5°C` | Setpoint relaxation applied to scheduled-unoccupied rooms during heating (`-1.5°C`). |
 | `FAN_LOW_TEMP_C` / `MED` / `HIGH_TEMP_C` | `21.0°C` / `22.0°C` / `23.0°C` | Indoor thresholds for graduated fan-only circulation (LOW/MEDIUM/HIGH), compressor off. |
 | `FAN_OFF_DIFFERENTIAL_C` | `0.5°C` | Switch-off hysteresis for fan circulation: once running, each stage holds until 0.5°C below its entry temperature. |
+| `FAN_HOT_SUPPRESS_OUTDOOR_C` / `FAN_SUPPRESS_OUTDOOR_DELTA_C` | `26.0°C` / `1.0°C` | Duct-heat guard: suppress fan circulation when ceiling-duct supply air would heat the house (outdoor that hot, or within delta of hottest room). Suppressed ticks fall through to Tier 3 solar pre-cool. |
+| `HOT_DAY_COOL_TRIGGER_OFFSET_C` | `1.0°C` | Warm/sunny pull-back applied to the Tier 1 cooling trigger when forecast $\ge 27^\circ\text{C}$ and outdoor $\ge 25^\circ\text{C}$ (day `24→23°C`). |
+| `WARM_SUNNY_PRECOOL_FORECAST_C` / `WARM_SUNNY_PRECOOL_OUTDOOR_C` / `WARM_SUNNY_PRECOOL_TARGET_C` | `27.0°C` / `25.0°C` / `22.0°C` | Early Tier 3 solar pre-cool gate/target for warm/sunny days below the deep `30.0°C → 21.0°C` gate. Same `2000 W` solar requirement. |
 | `PRECOOL_FORECAST_MAX_C` / `TARGET_C` | `30.0°C` / `21.0°C` | BOM forecast high gate and target temperature for Tier 3 Solar Pre-Cooling. |
+| `TIER3_PRECOOL_OUTDOOR_C` | `29.0°C` | Current-outdoor gate for deep Tier 3 pre-cooling: a 31°C afternoon banks to `21.0°C` even when the forecast is below `30.0°C`. |
+| `TIER3_PRECOOL_HOLD_DROP_C` | `0.5°C` | Latch for an active pre-cool run: holds until rooms fall to target − this (not target + `0.2°C`), so free solar keeps banking instead of stopping at the comfort line. |
 | `PREHEAT_FORECAST_MAX_C` / `MIN_C` / `TARGET_C` | `16.0°C` / `8.0°C` / `22.0°C` | BOM forecast gates and target temperature for Tier 3 Solar Pre-Heating. |
 
 ---
