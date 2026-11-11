@@ -198,8 +198,14 @@ def load_config():
         "PREHEAT_FORECAST_MIN_C": 8.0,
         "PREHEAT_TARGET_C": 22.0,
         "HEAT_SUPPRESS_FORECAST_MAX_C": 26.0,
+        "COOLING_SEASON_START_MD": [10, 15],
+        "COOLING_SEASON_END_MD": [4, 15],
+        "COOLING_SEASON_HEAT_SUPPRESS_MAX_C": 21.0,
         "NIGHT_PURGE_DELTA_C": 2.0,
         "NIGHT_PURGE_MIN_OUTDOOR_C": 15.0,
+        "NIGHT_PURGE_PROVE_MINUTES": 20.0,
+        "NIGHT_PURGE_REQUIRED_DROP_C": 0.3,
+        "NIGHT_PURGE_COOLDOWN_MINUTES": 60.0,
         "FAN_LOW_TEMP_C": 21.0,
         "FAN_MED_TEMP_C": 22.0,
         "FAN_HIGH_TEMP_C": 23.0,
@@ -381,6 +387,9 @@ def read_cache():
         "hvac_compressor_running": None,
         "hvac_active_tier": "IDLE",
         "hvac_solar_bank_cancelled_date": None,
+        "hvac_purge_attempt_start": None,
+        "hvac_purge_attempt_start_temp_c": None,
+        "hvac_purge_suspended_until": None,
         "weather_state": {},
         "last_weather_check_time": None,
         "shadow_hvac_plan": {},
@@ -1486,6 +1495,24 @@ def get_active_comfort_band(now: dt, config: Dict) -> Dict[str, float]:
     }
 
 
+def is_cooling_season(now: dt, config: Dict) -> bool:
+    """
+    Macro seasonal bias: mid-Oct..mid-Apr prioritises keeping cool,
+    mid-Apr..mid-Oct prioritises keeping warm. Wraps the calendar year.
+    Config: COOLING_SEASON_START_MD=[10,15], END_MD=[4,15].
+    """
+    try:
+        s_m, s_d = [int(x) for x in config.get("COOLING_SEASON_START_MD", [10, 15])]
+        e_m, e_d = [int(x) for x in config.get("COOLING_SEASON_END_MD", [4, 15])]
+    except Exception:
+        s_m, s_d, e_m, e_d = 10, 15, 4, 15
+    md = (now.month, now.day)
+    start, end = (s_m, s_d), (e_m, e_d)
+    if start <= end:
+        return start <= md <= end
+    return md >= start or md <= end
+
+
 def is_zone_effectively_occupied(z_meta: Dict, now: dt) -> bool:
     """
     Determines whether a zone is scheduled as occupied at `now`, accounting for
@@ -1927,28 +1954,112 @@ def evaluate_tier1_immediate_comfort(
         purge_delta = float(config.get("NIGHT_PURGE_DELTA_C", 2.0))
         purge_min_outdoor = float(config.get("NIGHT_PURGE_MIN_OUTDOOR_C", 15.0))
 
-        # Differential Cooling / Night Purge check
+        # Differential Cooling / Night Purge check with effectiveness circuit-breaker.
+        # FAN recirculates through the sun-heated ceiling duct void, so on sunny
+        # afternoons a large indoor-outdoor delta does NOT guarantee cooling.
+        # The purge must prove a measured drop within PROVE_MINUTES or it is
+        # suspended for COOLDOWN_MINUTES (compressor / Tier 3 runs instead),
+        # then retried. This cycles: purge chance -> breakout -> retry.
         if (
             outdoor_c is not None
             and outdoor_c <= (max_temp_c - purge_delta)
             and outdoor_c >= purge_min_outdoor
             and max_temp_c < (cool_trigger + 1.5)
         ):
-            zone_cmds = build_zone_plan_for_mode("FAN", False, now, live_zones, config)
-            return True, {
-                "tier": "TIER1_NIGHT_PURGE",
-                "power": "ON",
-                "mode": "FAN",
-                "fan_speed": "HIGH",
-                "setpoint_c": None,
-                "zone_commands": zone_cmds,
-                "draws_compressor_power": False,
-                "reason": (
-                    f"Differential Night Purge ({band['period']}): {max_zone_name}={max_temp_c:.1f}°C, "
-                    f"Outdoor={outdoor_c:.1f}°C (delta >= {purge_delta:.1f}°C)"
-                ),
-            }
+            prove_mins = float(config.get("NIGHT_PURGE_PROVE_MINUTES", 20.0))
+            required_drop = float(config.get("NIGHT_PURGE_REQUIRED_DROP_C", 0.3))
+            cooldown_mins = float(config.get("NIGHT_PURGE_COOLDOWN_MINUTES", 60.0))
+            purge_breaker_note = None
+            suspended_until = None
+            suspended_str = cache.get("hvac_purge_suspended_until")
+            if suspended_str:
+                try:
+                    suspended_until = dt.fromisoformat(suspended_str).astimezone(
+                        now.tzinfo
+                    )
+                    if now < suspended_until:
+                        purge_breaker_note = (
+                            f"Purge suspended (proved ineffective, retry after "
+                            f"{suspended_until.strftime('%H:%M')})"
+                        )
+                    else:
+                        cache["hvac_purge_suspended_until"] = None
+                        cache["hvac_purge_attempt_start"] = None
+                        cache["hvac_purge_attempt_start_temp_c"] = None
+                        suspended_until = None
+                except Exception:
+                    cache["hvac_purge_suspended_until"] = None
+                    suspended_until = None
+            if suspended_until is None or now >= suspended_until:
+                start_str = cache.get("hvac_purge_attempt_start")
+                start_temp = cache.get("hvac_purge_attempt_start_temp_c")
+                start_dt = None
+                if start_str and active_tier == "TIER1_NIGHT_PURGE":
+                    try:
+                        start_dt = dt.fromisoformat(start_str).astimezone(now.tzinfo)
+                        start_temp = float(start_temp)
+                    except Exception:
+                        start_dt = None
+                if start_dt is None:
+                    cache["hvac_purge_attempt_start"] = now.isoformat()
+                    cache["hvac_purge_attempt_start_temp_c"] = float(max_temp_c)
+                else:
+                    elapsed_mins = (now - start_dt).total_seconds() / 60.0
+                    if elapsed_mins >= prove_mins:
+                        measured_drop = float(start_temp) - float(max_temp_c)
+                        if measured_drop >= required_drop:
+                            cache["hvac_purge_attempt_start"] = now.isoformat()
+                            cache["hvac_purge_attempt_start_temp_c"] = float(
+                                max_temp_c
+                            )
+                        else:
+                            until_dt = now + datetime.timedelta(minutes=cooldown_mins)
+                            cache["hvac_purge_suspended_until"] = until_dt.isoformat()
+                            cache["hvac_purge_attempt_start"] = None
+                            cache["hvac_purge_attempt_start_temp_c"] = None
+                            purge_breaker_note = (
+                                f"Purge breaker tripped ({start_temp:.1f}->{max_temp_c:.1f}°C "
+                                f"over {elapsed_mins:.0f}m < {required_drop:.1f}°C drop, "
+                                f"retry after {until_dt.strftime('%H:%M')})"
+                            )
+                            suspended_until = until_dt
+                if suspended_until is None or now >= suspended_until:
+                    # Clear any stale breaker note when purge is (re)entered.
+                    zone_cmds = build_zone_plan_for_mode("FAN", False, now, live_zones, config)
+                    return True, {
+                        "tier": "TIER1_NIGHT_PURGE",
+                        "power": "ON",
+                        "mode": "FAN",
+                        "fan_speed": "HIGH",
+                        "setpoint_c": None,
+                        "zone_commands": zone_cmds,
+                        "draws_compressor_power": False,
+                        "reason": (
+                            f"Differential Night Purge ({band['period']}): {max_zone_name}={max_temp_c:.1f}°C, "
+                            f"Outdoor={outdoor_c:.1f}°C (delta >= {purge_delta:.1f}°C)"
+                        ),
+                    }
+            if purge_breaker_note:
+                zone_cmds = build_zone_plan_for_mode("COOL", False, now, live_zones, config)
+                return True, {
+                    "tier": "TIER1_COMFORT_COOL",
+                    "power": "ON",
+                    "mode": "COOL",
+                    "fan_speed": "LOW",
+                    "setpoint_c": cool_target,
+                    "zone_commands": zone_cmds,
+                    "draws_compressor_power": True,
+                    "reason": (
+                        f"Immediate cooling needed ({band['period']} band {heat_trigger:.0f}-{cool_trigger:.0f}°C{_cool_trigger_note}): "
+                        f"{max_zone_name}={max_temp_c:.1f}°C >= {cool_trigger:.1f}°C -> Target {cool_target:.1f}°C "
+                        f"[{purge_breaker_note}]"
+                    ),
+                }
 
+        # Purge not taken (too hot for purge band, or outdoor delta not met):
+        # clear stale attempt so the next eligible purge starts a fresh window.
+        cache["hvac_purge_attempt_start"] = None
+        cache["hvac_purge_attempt_start_temp_c"] = None
         zone_cmds = build_zone_plan_for_mode("COOL", False, now, live_zones, config)
         return True, {
             "tier": "TIER1_COMFORT_COOL",
@@ -1963,6 +2074,12 @@ def evaluate_tier1_immediate_comfort(
                 f"{max_zone_name}={max_temp_c:.1f}°C >= {cool_trigger:.1f}°C -> Target {cool_target:.1f}°C"
             ),
         }
+
+    # No compressor cooling this tick (comfortable, fan-only, or heating):
+    # close out any finished purge attempt so the next heat wave starts a
+    # fresh prove window. Suspension is kept until expiry.
+    cache["hvac_purge_attempt_start"] = None
+    cache["hvac_purge_attempt_start_temp_c"] = None
 
     # Graduated fan-only circulation for the warm-but-not-hot band.
     # Compressor triggers above take precedence; this branch only runs when no
@@ -2057,6 +2174,11 @@ def evaluate_tier1_immediate_comfort(
         except (TypeError, ValueError):
             forecast_max = 0.0
         suppress_at = float(config.get("HEAT_SUPPRESS_FORECAST_MAX_C", 26.0))
+        if is_cooling_season(now, config):
+            suppress_at = min(
+                suppress_at,
+                float(config.get("COOLING_SEASON_HEAT_SUPPRESS_MAX_C", 21.0)),
+            )
         if weather_state is not None and forecast_max >= suppress_at:
             return False, {
                 "tier": "IDLE",
@@ -2195,6 +2317,7 @@ def evaluate_tier3_solar_banking(
         _outdoor_c is not None
         and forecast_max_c >= warm_forecast_c
         and _outdoor_c >= warm_outdoor_c
+        and is_cooling_season(now, config)
     ):
         precool_target_eff = warm_target_c
         precool_label = (
@@ -2225,8 +2348,37 @@ def evaluate_tier3_solar_banking(
                 ),
             }
 
-    # Check Solar Pre-Heat
-    if forecast_max_c <= preheat_forecast_max_c or forecast_min_c <= preheat_forecast_min_c:
+    # Check Solar Pre-Heat with seasonal bias. Heating season (mid-Apr..mid-Oct):
+    # cold day OR frosty night justifies banking. Cooling season (mid-Oct..mid-Apr):
+    # a frosty night alone must not heat the house at 10am ahead of a mild 22C
+    # day — require a genuinely cold forecast max, and never fight the morning
+    # warm-up (outdoor already closing on forecast max while rooms sit in band).
+    cooling_season = is_cooling_season(now, config)
+    preheat_eligible = False
+    if cooling_season:
+        preheat_eligible = forecast_max_c <= preheat_forecast_max_c
+    else:
+        preheat_eligible = (
+            forecast_max_c <= preheat_forecast_max_c
+            or forecast_min_c <= preheat_forecast_min_c
+        )
+    if preheat_eligible and cooling_season and now.hour < 12 and _outdoor_c is not None:
+        day_min_c = float(config.get("DAY_COMFORT_MIN_C", 18.0))
+        if (
+            forecast_max_c >= float(config.get("COOLING_SEASON_HEAT_SUPPRESS_MAX_C", 21.0))
+            and _outdoor_c >= (forecast_max_c - 6.0)
+            and min_prio_temp >= (day_min_c - 0.5)
+        ):
+            return False, {
+                "tier": "IDLE",
+                "power": "OFF",
+                "reason": (
+                    f"Morning warm-up: outdoor {_outdoor_c:.1f}°C closing on forecast "
+                    f"max {forecast_max_c:.1f}°C, rooms {min_prio_temp:.1f}°C in band; "
+                    f"sun warms house for free"
+                ),
+            }
+    if preheat_eligible:
         threshold_temp = (preheat_target_c - 0.2) if active_tier == "TIER3_PREHEAT" else (preheat_target_c - 0.6)
         if min_prio_temp < threshold_temp:
             zone_cmds = build_zone_plan_for_mode("HEAT", True, now, live_zones, config)
